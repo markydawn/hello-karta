@@ -2,15 +2,185 @@ version: 2
 jobs:
   build:
     docker:
-      - image: debian:stretch
-
+      - image: circleci/node
     steps:
       - checkout
-
+      - restore_cache:
+          keys:
+            - v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+            - v1-deps-{ .Branch }
+            - v1-deps
       - run:
-          name: Greeting
-          command: echo Hello, world.
-
+          name: Install
+          command: "[[ -d node_modules ]] || npm ci"
+      - save_cache:
+           key: v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+           paths:
+              - ./node_modules/
+              - /root/.npm
+              - ~/.cache
+  publish:
+    docker:
+      - image: circleci/node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+            - v1-deps-{ .Branch }
+            - v1-deps
       - run:
-          name: Print the Current Time
-          command: date
+          name: Build
+          command: npm run build
+      - save_cache:
+           key: dist-v1-{{ .Branch }}-{{ .Revision }}
+           paths:
+              - ./dist/
+  code-quality:
+    docker:
+      - image: circleci/node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+            - v1-deps-{ .Branch }
+            - v1-deps
+      - run:
+          name: Lint
+          command: npm run lint
+  unit-test:
+    docker:
+      - image: circleci/node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+            - v1-deps-{ .Branch }
+            - v1-deps
+      - run:
+          name: Test
+          command: npm run test:unit
+  e2e-test:
+    docker:
+      - image: cypress/browsers:chrome67
+      - image: circleci/node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+            - v1-deps-{ .Branch }
+            - v1-deps
+      - run:
+          name: Test
+          command: npm ci && npm run test:e2e
+  deploy-to-staging:
+    machine: true
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - dist-v1-{{ .Branch }}-{{ .Revision }}
+            - dist-v1-{{ .Branch }}-
+            - dist-v1--
+      - run:
+          name: Setup Heroku
+          command: chmod +x .circleci/setup-heroku.sh && .circleci/setup-heroku.sh $HEROKU_STAGING_APP_NAME
+      - run: heroku container:login
+      - run: echo "pushing app $HEROKU_STAGING_APP_NAME" && heroku container:push web -a $HEROKU_STAGING_APP_NAME
+      - run: heroku releases --app $HEROKU_STAGING_APP_NAME
+      - run: echo "releasing app $HEROKU_STAGING_APP_NAME" && heroku container:release web -a $HEROKU_STAGING_APP_NAME
+      - run: heroku releases --app $HEROKU_STAGING_APP_NAME
+  deploy-to-production:
+    machine: true
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - dist-v1-{{ .Branch }}-{{ .Revision }}
+            - dist-v1-{{ .Branch }}-
+            - dist-v1--
+      - run:
+          name: Setup Heroku
+          command: chmod +x .circleci/setup-heroku.sh && .circleci/setup-heroku.sh $HEROKU_APP_NAME
+      - run: heroku container:login
+      - run: echo "pushing app $HEROKU_APP_NAME" && heroku container:push web -a $HEROKU_APP_NAME
+      - run: heroku releases --app $HEROKU_APP_NAME
+      - run: echo "releasing app $HEROKU_APP_NAME" && heroku container:release web -a $HEROKU_APP_NAME
+      - run: heroku releases --app $HEROKU_APP_NAME
+  staging-e2e:
+    docker:
+      - image: cypress/browsers:chrome67
+      - image: circleci/node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+            - v1-deps-{ .Branch }
+            - v1-deps
+      - run:
+          name: E2E tests over $STAGING_APP_URL
+          command: echo $STAGING_APP_URL && npm ci && npm run test:e2e:no-dev $STAGING_APP_URL
+  production-e2e:
+    docker:
+      - image: cypress/browsers:chrome67
+      - image: circleci/node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-deps-{ .Branch }-{ checksum "package-lock.json" }
+            - v1-deps-{ .Branch }
+            - v1-deps
+      - run:
+          name: E2E tests over $APP_URL
+          command: echo $APP_URL && npm ci && npm run test:e2e:no-dev $APP_URL
+  ping:
+    docker:
+      - image: circleci/node
+    steps:
+      - checkout
+      - run:
+          name: Ping site
+          command: chmod +x .circleci/ping.sh && .circleci/ping.sh $APP_URL
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - build
+      - code-quality:
+          requires:
+          - build
+      - unit-test:
+          requires:
+          - code-quality
+      - e2e-test:
+          requires:
+          - code-quality
+      - publish:
+          requires:
+          - unit-test
+          - e2e-test
+      - deploy-to-staging:
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - publish
+      - staging-e2e:
+          requires:
+            - deploy-to-staging
+      - approve-release:
+          type: approval
+          requires:
+            - staging-e2e
+      - deploy-to-production:
+          requires:
+            - approve-release
+      - production-e2e:
+          requires:
+            - deploy-to-production
